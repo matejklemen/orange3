@@ -2,11 +2,12 @@ from collections import namedtuple, OrderedDict
 
 import numpy as np
 
-from AnyQt.QtWidgets import QListView, QApplication
-from AnyQt.QtGui import QBrush, QColor, QPainter
+from AnyQt.QtWidgets import QListView, QApplication, QToolTip
+from AnyQt.QtGui import QBrush, QColor, QPainter, QCursor
 from AnyQt.QtCore import QEvent, QItemSelectionModel, QItemSelection
 
 import pyqtgraph as pg
+
 import Orange.data
 from Orange.statistics import contingency
 
@@ -14,11 +15,15 @@ from Orange.widgets import widget, gui, settings
 from Orange.widgets.utils import itemmodels, colorpalette
 from Orange.widgets.utils.widgetpreview import WidgetPreview
 
-from Orange.widgets.visualize.owscatterplotgraph import ScatterPlotItem
+from Orange.widgets.visualize.owscatterplotgraph import ScatterPlotItem, LegendItem
 from Orange.widgets.widget import Input
 
 
 class ScatterPlotItem(pg.ScatterPlotItem):
+    def __init__(self, attr=None, **kwargs):
+        super().__init__(**kwargs)
+        self.attr = attr
+
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
         painter.setRenderHint(QPainter.Antialiasing, True)
@@ -100,7 +105,43 @@ class OWCorrespondenceAnalysis(widget.OWWidget):
 
         self.plot = pg.PlotWidget(background="w")
         self.plot.setMenuEnabled(False)
+        ######
+        self.legend_items = []
+        self.legend = LegendItem()
+        self.legend.setParentItem(self.plot.getPlotItem().getViewBox())
+        self.legend.restoreAnchor(((1, 0), (1, 0)))
+        self.legend.setVisible(True)
+        self._update_legend()
+
+        # def _create_legend(self, anchor):
+        #     legend = LegendItem()
+        #     legend.setParentItem(self.plot_widget.getViewBox())
+        #     legend.restoreAnchor(anchor)
+        #     return legend
+        ######
+        self.plot.scene().sigMouseMoved.connect(self._on_mouse_moved)
         self.mainArea.layout().addWidget(self.plot)
+
+    def _update_legend(self):
+        self.legend.clear()
+        for (attr_name, brush, pen) in self.legend_items:
+            self.legend.addItem(
+                ScatterPlotItem(pen=pen, brush=brush, size=10, symbol="o"), attr_name)
+
+    def _on_mouse_moved(self, pos):
+        attr_sps = self.plot.getPlotItem().listDataItems()
+
+        hovered_attrs = set()
+        for curr_sp in attr_sps:
+            act_pos = curr_sp.mapFromScene(pos)
+            pts = curr_sp.pointsAt(act_pos)
+            if len(pts) > 0:
+                hovered_attrs.add(curr_sp.attr)
+
+        if len(hovered_attrs) > 0:
+            QToolTip.showText(QCursor.pos(), "Attrs: {}".format(", ".join(hovered_attrs)))
+        else:
+            QToolTip.hideText()
 
     @Inputs.data
     def set_data(self, data):
@@ -188,6 +229,8 @@ class OWCorrespondenceAnalysis(widget.OWWidget):
         self.axis_y_cb.clear()
         ca_vars = self.selected_vars()
         if len(ca_vars) == 0:
+            self.legend_items = []
+            self._update_legend()
             return
 
         multi = len(ca_vars) != 2
@@ -219,6 +262,7 @@ class OWCorrespondenceAnalysis(widget.OWWidget):
             return minmax
 
         self.plot.clear()
+        self.legend_items = []
         points = self.ca
         variables = self.selected_vars()
         colors = colorpalette.ColorPaletteGenerator(len(variables))
@@ -248,16 +292,21 @@ class OWCorrespondenceAnalysis(widget.OWWidget):
         margin = margin * 0.05 if margin > 1e-10 else 1
         self.plot.setYRange(minmax[2] - margin, minmax[3] + margin)
 
-        for i, (v, points) in enumerate(zip(variables, points)):
+        rows = sorted(
+            ind.row() for ind in self.varview.selectionModel().selectedRows())
+
+        for i, (idx_var, v, points) in enumerate(zip(rows, variables, points)):
             color_outline = colors[i]
             color_outline.setAlpha(200)
             color = QColor(color_outline)
             color.setAlpha(120)
+            pen = pg.mkPen(color_outline.darker(120), width=1.5)
+            brush = QBrush(color)
             item = ScatterPlotItem(
-                x=points[:, 0], y=points[:, 1], brush=QBrush(color),
-                pen=pg.mkPen(color_outline.darker(120), width=1.5),
-                size=np.full((points.shape[0],), 10.1),
+                x=points[:, 0], y=points[:, 1], brush=brush, pen=pen,
+                size=np.full((points.shape[0],), 10.1), attr=v.name
             )
+            self.legend_items.append((v.name, brush, pen))
             self.plot.addItem(item)
 
             for name, point in zip(v.values, points):
@@ -277,6 +326,8 @@ class OWCorrespondenceAnalysis(widget.OWWidget):
         ax = self.plot.getAxis("left")
         ax.setLabel("Component {} ({:.1f}%)"
                     .format(p_axes[1] + 1, inertia[p_axes[1]]))
+
+        self._update_legend()
 
     def _update_info(self):
         if self.ca is None:
