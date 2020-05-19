@@ -5,11 +5,12 @@ from types import SimpleNamespace as namespace
 import numpy as np
 
 from AnyQt.QtCore import Qt, QRectF, QLineF, QPoint
-from AnyQt.QtGui import QColor
+from AnyQt.QtGui import QColor, QCursor
+from AnyQt.QtWidgets import QToolTip
 
 import pyqtgraph as pg
 
-from Orange.data import Table
+from Orange.data import Table, ContinuousVariable, DiscreteVariable
 from Orange.projection import FreeViz
 from Orange.projection.freeviz import FreeVizModel
 from Orange.widgets import widget, gui, settings
@@ -18,6 +19,7 @@ from Orange.widgets.utils.widgetpreview import WidgetPreview
 from Orange.widgets.visualize.utils.component import OWGraphWithAnchors
 from Orange.widgets.visualize.utils.plotutils import AnchorItem
 from Orange.widgets.visualize.utils.widget import OWAnchorProjectionWidget
+from Orange.widgets.widget import Input, Output
 
 
 class Result(namespace):
@@ -33,7 +35,7 @@ def run_freeviz(data: Table, projector: FreeViz, state: TaskState):
     step, steps = 0, MAX_ITERATIONS
     initial = res.projector.components_.T
     state.set_status("Calculating...")
-    while True:
+    while step < steps:
         # Needs a copy because projection should not be modified inplace.
         # If it is modified inplace, the widget and the thread hold a
         # reference to the same object. When the thread is interrupted it
@@ -84,11 +86,15 @@ class OWFreeVizGraph(OWGraphWithAnchors):
         if points is None:
             return
         r = self.scaled_radius
+        feat_importances = []
         if self.anchor_items is None:
             self.anchor_items = []
             for point, label in zip(points, labels):
                 anchor = AnchorItem(line=QLineF(0, 0, *point), text=label)
-                anchor.setVisible(np.linalg.norm(point) > r)
+                is_visible = np.linalg.norm(point) > r
+                if is_visible:
+                    feat_importances.append((label, np.linalg.norm(point)))
+                anchor.setVisible(is_visible)
                 anchor.setPen(pg.mkPen((100, 100, 100)))
                 self.plot_widget.addItem(anchor)
                 self.anchor_items.append(anchor)
@@ -96,7 +102,16 @@ class OWFreeVizGraph(OWGraphWithAnchors):
             for anchor, point, label in zip(self.anchor_items, points, labels):
                 anchor.setLine(QLineF(0, 0, *point))
                 anchor.setText(label)
-                anchor.setVisible(np.linalg.norm(point) > r)
+                is_visible = np.linalg.norm(point) > r
+                if is_visible:
+                    feat_importances.append((label, np.linalg.norm(point)))
+                anchor.setVisible(is_visible)
+
+        if r < (0 + 1e-3):
+            print("**Feature importances**")
+            for i, (lbl, importance) in enumerate(sorted(feat_importances, key=lambda tup: -tup[1]), start=1):
+                print(f"#{i}, {lbl}, {importance}")
+            print("**-------------------**")
 
     def update_circle(self):
         super().update_circle()
@@ -135,6 +150,13 @@ class OWFreeViz(OWAnchorProjectionWidget, ConcurrentWidgetMixin):
     initialization = settings.Setting(InitType.Circular)
     GRAPH_CLASS = OWFreeVizGraph
     graph = settings.SettingProvider(OWFreeVizGraph)
+    num_neighs = settings.Setting(5)
+    sd_factor = settings.Setting(2.0)
+
+    class Inputs:
+        data = Input("Data", Table)
+        data_subset = Input("Data subset", Table)
+        new_data = Input("New data", Table)
 
     class Error(OWAnchorProjectionWidget.Error):
         no_class_var = widget.Msg("Data has no target variable")
@@ -147,21 +169,39 @@ class OWFreeViz(OWAnchorProjectionWidget, ConcurrentWidgetMixin):
         not_enough_features = widget.Msg("At least two features are required")
 
     class Warning(OWAnchorProjectionWidget.Warning):
-        removed_features = widget.Msg("Categorical features with more than"
-                                      " two values are not shown.")
+        removed_features = widget.Msg("Non-binary categorical features are not shown.")
 
     def __init__(self):
         OWAnchorProjectionWidget.__init__(self)
         ConcurrentWidgetMixin.__init__(self)
 
+        self.new_data = None
+        self.new_data_scatter = None
+        self.new_data_tooltip = None
+
     def _add_controls(self):
         self.__add_controls_start_box()
         super()._add_controls()
         self.gui.add_control(
-            self._effects_box, gui.hSlider, "Hide radius:", master=self.graph,
+            self._effects_box, gui.hSlider, "Hide radius*:", master=self.graph,
             value="hide_radius", minValue=0, maxValue=100, step=10,
             createLabel=False, callback=self.__radius_slider_changed
         )
+
+        box = gui.widgetBox(self.controlArea, 'Outlier detection settings')
+        gui.spin(box, self, value="num_neighs", minv=1, maxv=20, step=1,
+                 label="Num. neighbours", alignment=Qt.AlignRight,
+                 callback=self.__num_neighs_changed, controlWidth=80)
+
+        gui.spin(box, self, value="sd_factor", minv=0.1, maxv=5.0, step=0.1,
+                 label="SD tolerance:", alignment=Qt.AlignRight,
+                 callback=self.__tolerance_changed, controlWidth=80, spinType=float)
+
+        # self.gui.add_control(
+        #     self._effects_box, gui.hSlider, "SD tolerance:", master=self.graph,
+        #     value="sd_factor", minValue=0.1, maxValue=5.0, step=0.1, createLabel=True,
+        #     callback=self.__tolerance_changed
+        # )
 
     def __add_controls_start_box(self):
         box = gui.vBox(self.controlArea, box=True)
@@ -178,6 +218,12 @@ class OWFreeViz(OWAnchorProjectionWidget, ConcurrentWidgetMixin):
 
     def __radius_slider_changed(self):
         self.graph.update_radius()
+
+    def __num_neighs_changed(self):
+        self.project_new_examples()
+
+    def __tolerance_changed(self):
+        self.project_new_examples()
 
     def __init_combo_changed(self):
         self.Error.proj_error.clear()
@@ -226,12 +272,129 @@ class OWFreeViz(OWAnchorProjectionWidget, ConcurrentWidgetMixin):
         self.graph.set_sample_size(None)
         self.run_button.setText("Start")
 
+    @Inputs.data
     # OWAnchorProjectionWidget
     def set_data(self, data):
         super().set_data(data)
         self.graph.set_sample_size(None)
         if self._invalidated:
             self.init_projection()
+
+    @Inputs.data_subset
+    def set_subset_data(self, subset):
+        super().set_subset_data(subset)
+
+    @Inputs.new_data
+    def set_new_data(self, new_data):
+        """ This is intended for projection of new examples, on which the projection is not adjusted. """
+        print("Setting new examples!")
+        self.new_data = new_data
+
+        # Clear previous projected (additional) examples
+        if self.new_data_scatter:
+            self.graph.plot_widget.removeItem(self.new_data_scatter)
+            self.graph.plot_widget.removeItem(self.new_data_tooltip)
+            self.new_data_scatter = None
+            self.new_data_tooltip = None
+
+        if self.new_data:
+            self.project_new_examples()
+
+    def mark_inliers(self):
+        embedded_existing = self.projection(self.data)
+        embedded_new = self.projection(self.new_data)
+
+        # No information about actual target variable, can't compare predicted (projected) vs actual
+        if not self.new_data.domain.class_var:
+            return
+
+        is_inlier = []
+        for i in range(len(embedded_new)):
+            sq_dists = np.sum(np.square(embedded_new.X[i, :] - embedded_existing.X), axis=1)
+
+            closest_indices = np.argsort(sq_dists)[:self.num_neighs]
+            closest_examples = embedded_existing[closest_indices]
+
+            mean_target = np.mean(closest_examples.Y)
+            sd_target = np.std(closest_examples.Y)
+            print("Mean - SD")
+            print(f"{mean_target} - {sd_target}")
+            print("Actual: ")
+            print(embedded_new.Y[i])
+
+            if (mean_target - self.sd_factor * sd_target) <= embedded_new.Y[i] <= (mean_target + self.sd_factor * sd_target):
+                is_inlier.append(True)
+            else:
+                is_inlier.append(False)
+
+        return is_inlier
+
+    def _tooltip_new_points(self, pos):
+        """ A hacked together method to display tooltips for new points"""
+        act_pos = self.new_data_scatter.mapFromScene(pos)
+        found_pts = self.new_data_scatter.pointsAt(act_pos)
+        if len(found_pts) != 0:
+            tooltip_data = []
+            for pt in found_pts:
+                tooltip_data.append(pt.data())
+
+            QToolTip.showText(QCursor.pos(), "\n".join(tooltip_data))
+
+    def project_new_examples(self):
+        print("Projecting new examples")
+        if self.new_data and self.projection:
+            new_embedded = self.projection(self.new_data).X
+            inlier_mask = self.mark_inliers()
+            pens, brushes = [], []
+            for is_inlier in inlier_mask:
+                if is_inlier:
+                    pens.append(pg.mkPen({'color': '#00400b'}))
+                    brushes.append(pg.mkBrush(color='#00ba20'))
+                else:
+                    pens.append(pg.mkPen({'color': '#400000'}))
+                    brushes.append(pg.mkBrush(color='#ba0900'))
+
+            try:
+                # Hacked together tooltip data (Meta attributes, followed by attribute values, 1 per line
+                formatted_examples = []
+                for idx_row in range(len(self.new_data)):
+                    metas_formatted = []
+                    for idx_meta, curr_meta in enumerate(self.new_data.domain.metas):
+                        metas_formatted.append(f"{curr_meta.name}={str(self.new_data.metas[idx_row, idx_meta])}")
+
+                    attrs_formatted = []
+                    for idx_attr, curr_attr in enumerate(self.new_data.domain.attributes):
+                        value = "?"
+                        if isinstance(curr_attr, ContinuousVariable):
+                            value = self.new_data.X[idx_row, idx_attr]
+                        elif isinstance(curr_attr, DiscreteVariable):
+                            value = curr_attr.values[int(self.new_data.X[idx_row, idx_attr])]
+
+                        attrs_formatted.append(f"{curr_attr.name} = {value}")
+
+                    attrs_formatted.append(f"{self.new_data.domain.class_var} = {self.new_data.Y[idx_row]}")
+
+                    formatted_examples.append("<b>[{}]</b>\n{}".format(
+                        ','.join(metas_formatted), '\n'.join(attrs_formatted)))
+
+                # Create square symbols for new examples so they can be spotted faster
+                # pen_data, brush_data = self.graph.get_colors()
+                kwargs = dict(x=new_embedded[:, 0], y=new_embedded[:, 1], data=formatted_examples)
+                new_pts = pg.ScatterPlotItem(**kwargs)
+                new_pts.setSymbol(symbol="s")
+                new_pts.setSize(size=24)
+                new_pts.setPen(pens, update=False, mask=None)  # outline
+                new_pts.setBrush(brushes, mask=None)  # fill
+
+                # Hacked together tooltips
+                self.new_data_scatter = new_pts
+                self.new_data_tooltip = pg.TextItem(text='', color=(176, 23, 31), anchor=(1, 1))
+                self.graph.plot_widget.addItem(self.new_data_scatter)
+                self.graph.plot_widget.addItem(self.new_data_tooltip)
+                self.new_data_scatter.scene().sigMouseMoved.connect(self._tooltip_new_points)
+            except Exception as e:
+                print("NOPE")
+                print(e)
 
     def init_projection(self):
         if self.data is None:
@@ -332,4 +495,4 @@ class MoveIndicator(pg.GraphicsObject):
 
 if __name__ == "__main__":  # pragma: no cover
     table = Table("zoo")
-    WidgetPreview(OWFreeViz).run(set_data=table, set_subset_data=table[::10])
+    WidgetPreview(OWFreeViz).run(set_data=table, set_new_data=table[::10])
