@@ -106,6 +106,7 @@ class OWFreeVizGraph(OWGraphWithAnchors):
                 if is_visible:
                     feat_importances.append((label, np.linalg.norm(point)))
                 anchor.setVisible(is_visible)
+        self.feat_importances = feat_importances
 
         if r < (0 + 1e-3):
             print("**Feature importances**")
@@ -196,12 +197,6 @@ class OWFreeViz(OWAnchorProjectionWidget, ConcurrentWidgetMixin):
         gui.spin(box, self, value="sd_factor", minv=0.1, maxv=5.0, step=0.1,
                  label="SD tolerance:", alignment=Qt.AlignRight,
                  callback=self.__tolerance_changed, controlWidth=80, spinType=float)
-
-        # self.gui.add_control(
-        #     self._effects_box, gui.hSlider, "SD tolerance:", master=self.graph,
-        #     value="sd_factor", minValue=0.1, maxValue=5.0, step=0.1, createLabel=True,
-        #     callback=self.__tolerance_changed
-        # )
 
     def __add_controls_start_box(self):
         box = gui.vBox(self.controlArea, box=True)
@@ -303,6 +298,19 @@ class OWFreeViz(OWAnchorProjectionWidget, ConcurrentWidgetMixin):
     def mark_inliers(self):
         embedded_existing = self.projection(self.data)
         embedded_new = self.projection(self.new_data)
+        # FreeViz not initialized
+        if not hasattr(self.graph, "feat_importances"):
+            print("feat_importances are not defined!")
+            return
+
+        # TODO: customizable weights based on how hard it is to tweak a certain feature
+        # - use euclidean dissimilarity 1 - 1 / (1 + euclidean dist) for [continuous] features
+        # - use hamming distance for [discrete] features
+        WEIGHTS = np.ones(len(self.data.domain.attributes)) / len(self.data.domain.attributes)
+
+        # Feature name -> feature importance (= norm of anchor line)
+        feat_importances = dict(self.graph.feat_importances)
+        feat_importances = [feat_importances[attr.name] for attr in self.data.domain.attributes]
 
         # No information about actual target variable, can't compare predicted (projected) vs actual
         if not self.new_data.domain.class_var:
@@ -310,9 +318,34 @@ class OWFreeViz(OWAnchorProjectionWidget, ConcurrentWidgetMixin):
 
         is_inlier = []
         for i in range(len(embedded_new)):
-            sq_dists = np.sum(np.square(embedded_new.X[i, :] - embedded_existing.X), axis=1)
+            dists = np.linalg.norm(embedded_new.X[i, :] - embedded_existing.X, axis=1)
+            time_reductions = self.new_data.Y[i] - self.data.Y
 
-            closest_indices = np.argsort(sq_dists)[:self.num_neighs]
+            nonzero_dists = dists > (0 + 1e-5)
+            pos_time_reduction = time_reductions > (0 + 1e-5)
+
+            valid_indices = np.arange(dists.shape[0])[np.logical_and(nonzero_dists, pos_time_reduction)]
+            # Sort by: (1) least required changes and (2) biggest time reduction
+            recommendation_indices = sorted(valid_indices, key=lambda idx: (dists[idx], -time_reductions[idx]))
+
+            # TODO: this is a WIP (works, but bloats up the visualization)
+            # for rank, idx_recommended in enumerate(recommendation_indices[:1], start=1):
+            #     print(f"#{rank} distance: {dists[idx_recommended]}, time reduction: {time_reductions[idx_recommended]}")
+            #     print(self.data[idx_recommended])
+            #     kwargs = dict(x=[embedded_existing.X[idx_recommended, 0] / self.max_insample_norm],
+            #                   y=[embedded_existing.X[idx_recommended, 1] / self.max_insample_norm], data=["bla"])
+            #     new_point = pg.ScatterPlotItem(**kwargs)
+            #     new_point.setSymbol(symbol="+")
+            #     new_point.setSize(size=24)
+            #     self.graph.plot_widget.addItem(new_point)
+
+            #     new_text = pg.TextItem(text=f"-{time_reductions[idx_recommended]:.2f}",
+            #                            anchor=(1, 1), color=(0, 0, 102))
+            #     new_text.setPos(embedded_existing.X[idx_recommended, 0] / self.max_insample_norm,
+            #                     embedded_existing.X[idx_recommended, 1] / self.max_insample_norm)
+            #     self.graph.plot_widget.addItem(new_text)
+
+            closest_indices = np.argsort(dists)[:self.num_neighs]
             closest_examples = embedded_existing[closest_indices]
 
             mean_target = np.mean(closest_examples.Y)
@@ -343,7 +376,8 @@ class OWFreeViz(OWAnchorProjectionWidget, ConcurrentWidgetMixin):
     def project_new_examples(self):
         print("Projecting new examples")
         if self.new_data and self.projection:
-            new_embedded = self.projection(self.new_data).X
+            new_embedded = self.projection(self.new_data).X / self.max_insample_norm
+
             inlier_mask = self.mark_inliers()
             pens, brushes = [], []
             for is_inlier in inlier_mask:
@@ -445,7 +479,8 @@ class OWFreeViz(OWAnchorProjectionWidget, ConcurrentWidgetMixin):
         if embedding is None:
             return None, None
         valid_emb = embedding[self.valid_data]
-        return valid_emb.T / (np.max(np.linalg.norm(valid_emb, axis=1)) or 1)
+        self.max_insample_norm = np.max(np.linalg.norm(valid_emb, axis=1)) or 1
+        return valid_emb.T / self.max_insample_norm
 
     def _manual_move(self, anchor_idx, x, y):
         self.projector.initial[anchor_idx] = [x, y]
